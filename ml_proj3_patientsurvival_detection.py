@@ -1,0 +1,227 @@
+import pandas as pd
+import numpy as np
+import seaborn as sns
+from sklearn.ensemble import AdaBoostClassifier, RandomForestClassifier
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import accuracy_score
+
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.metrics import silhouette_score, accuracy_score, make_scorer
+from sklearn.decomposition import PCA
+import umap.umap_ as umap
+from sklearn.manifold import trustworthiness
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import AdaBoostClassifier, RandomForestClassifier
+from sklearn.preprocessing import RobustScaler
+import warnings
+import os
+warnings.filterwarnings("ignore")
+
+script_dir = os.path.dirname(os.path.realpath(__file__))
+
+data = pd.read_csv(os.path.join(script_dir, "patient.csv"))
+
+data.drop(["encounter_id", "patient_id", "hospital_id", "Unnamed: 83" ], axis=1, inplace=True)
+data = data[data['ethnicity'] == 'Caucasian']
+
+Num = [col for col in data.columns if data[col].dtype in [int, float]]
+for col in Num:
+    data[col].fillna(data[col].median(), inplace=True)
+
+categorical = [col for col in data.columns if data[col].dtype == object]
+for col in categorical:
+    data[col].fillna(data[col].mode()[0], inplace=True)
+
+from category_encoders import CountEncoder
+CE = CountEncoder(normalize=True, cols=categorical)
+data = CE.fit_transform(data)
+
+sampled_data = data.sample(frac=0.2, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(sampled_data.drop("hospital_death", axis=1), sampled_data["hospital_death"], test_size=0.2, random_state=42, stratify=sampled_data["hospital_death"])
+
+RS_train = RobustScaler()
+X_train_scaled = RS_train.fit_transform(X_train)
+
+RS_test = RobustScaler()
+X_test_scaled = RS_test.fit_transform(X_test)
+
+pca = PCA()
+pca.fit(X_train_scaled)
+
+plt.figure(figsize=(12, 6))
+plt.plot(range(1, len(pca.explained_variance_ratio_) + 1), pca.explained_variance_ratio_, linestyle='-', color='b')
+plt.title('Scree Plot')
+plt.xlabel('Number of Components')
+plt.ylabel('Explained Variance Ratio')
+plt.xticks(range(1, len(pca.explained_variance_ratio_) + 1))
+plt.xticks(rotation=90)
+plt.grid(True)
+plt.show()
+
+threshold = 0.95
+cumulative_variance = np.cumsum(pca.explained_variance_ratio_)
+num_components_threshold = np.argmax(cumulative_variance >= threshold) + 1
+
+print(f"Number of components explaining {threshold:.0%} of variance:", num_components_threshold)
+
+plt.figure(figsize=(12, 6))
+plt.plot(range(1, len(cumulative_variance) + 1), cumulative_variance, marker='o', linestyle='-', color='r')
+plt.title('Cumulative Explained Variance')
+plt.xlabel('Number of Components')
+plt.ylabel('Cumulative Variance Explained')
+plt.xticks(range(1, len(cumulative_variance) + 1))
+plt.xticks(rotation=90)
+plt.axvline(x=num_components_threshold, color='k', linestyle='--', linewidth=1)
+plt.axhline(y=threshold, color='b', linestyle='--', linewidth=1)
+plt.text(num_components_threshold + 0.5, threshold - 0.1, f'{threshold:.0%} Variance', color='b')
+plt.grid(True)
+plt.show()
+
+num_components_retained = 28
+pca_retained = PCA(n_components=num_components_retained)
+pca_data_train = pca_retained.fit_transform(X_train_scaled)
+pca_data_test = pca_retained.transform(X_test_scaled)
+
+plt.figure(figsize=(8, 6))
+sns.histplot(data['hospital_death'], bins=2, kde=False, color='skyblue', edgecolor='black')
+plt.title('Histogram of Hospital Death')
+plt.xlabel('Hospital Death')
+plt.ylabel('Frequency')
+plt.xticks([0, 1], ['Survived', 'Deceased'])
+plt.show()
+
+umap_param_grid = {'n_neighbors': [5, 10, 15],
+                   'min_dist': [0.25, 0.5]}
+best_trustworthiness = 0
+best_umap = None
+best_umap_data = None
+best_num_components = None
+
+for n_neighbors in umap_param_grid['n_neighbors']:
+    for min_dist in umap_param_grid['min_dist']:
+        ump = umap.UMAP(n_neighbors=n_neighbors, min_dist=min_dist)
+        ump.fit(X_train_scaled)
+        umap_data_train = ump.transform(X_train_scaled)
+        current_trustworthiness = trustworthiness(X_train_scaled, umap_data_train)
+        if current_trustworthiness > best_trustworthiness:
+            best_trustworthiness = current_trustworthiness
+            best_umap = ump
+            best_umap_data = umap_data_train
+            best_num_components = umap_data_train.shape[1]
+
+print("Best UMAP parameters:", best_umap.get_params())
+print("Best trustworthiness:", best_trustworthiness)
+print("Best number of components:", best_num_components)
+
+umap_data_train_best = best_umap.transform(X_train_scaled)
+umap_data_test_best = best_umap.transform(X_test_scaled)
+
+kmeans_param_grid = {'n_clusters': [3, 4, 5]}
+agglo_param_grid = {'n_clusters': [3, 4, 5],
+                    'linkage': ['ward', 'single']}
+silhouette_scores = pd.DataFrame(index=['Original', 'PCA Reduced', 'UMAP Reduced'],
+                                 columns=['KMeans', 'Agglomerative'])
+best_parameters = pd.DataFrame(index=['KMeans', 'Agglomerative'], columns=['Method', 'n_clusters', 'linkage'])
+best_num_clusters_kmeans = {}
+best_num_clusters_agglo = {}
+
+for idx, (method, method_name) in enumerate(zip([X_train_scaled, pca_data_train, umap_data_train_best],
+                                                ['Original', 'PCA Reduced', 'UMAP Reduced'])):
+    best_kmeans_score = -1
+    for n_clusters in kmeans_param_grid['n_clusters']:
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+        kmeans.fit(method)
+        kmeans_score = silhouette_score(method, kmeans.labels_)
+        if kmeans_score > best_kmeans_score:
+            best_kmeans_score = kmeans_score
+            best_num_clusters_kmeans[method_name] = n_clusters
+            best_parameters.loc['KMeans', 'Method'] = method_name
+            best_parameters.loc['KMeans', 'n_clusters'] = n_clusters
+    silhouette_scores.loc[method_name, 'KMeans'] = best_kmeans_score
+
+    best_agglo_score = -1
+    for n_clusters in agglo_param_grid['n_clusters']:
+        for linkage in agglo_param_grid['linkage']:
+            agglo = AgglomerativeClustering(n_clusters=n_clusters, linkage=linkage)
+            agglo.fit(method)
+            agglo_score = silhouette_score(method, agglo.labels_)
+            if agglo_score > best_agglo_score:
+                best_agglo_score = agglo_score
+                best_num_clusters_agglo[method_name] = (n_clusters, linkage)
+                best_parameters.loc['Agglomerative', 'Method'] = method_name
+                best_parameters.loc['Agglomerative', 'n_clusters'] = n_clusters
+                best_parameters.loc['Agglomerative', 'linkage'] = linkage
+    silhouette_scores.loc[method_name, 'Agglomerative'] = best_agglo_score
+
+print("Silhouette Scores:")
+print(silhouette_scores)
+
+print("Best number of clusters for KMeans:")
+for method_name, num_clusters in best_num_clusters_kmeans.items():
+    print(f"{method_name}: {num_clusters}")
+
+print("Best number of clusters for Agglomerative Clustering:")
+for method_name, (num_clusters, linkage) in best_num_clusters_agglo.items():
+    print(f"{method_name}: {num_clusters} clusters with linkage {linkage}")
+
+fig, axes = plt.subplots(2, figsize=(18, 12))
+method = KMeans(n_clusters=best_parameters.loc['KMeans', 'n_clusters'], random_state=42)
+method.fit(X_train_scaled)
+axes[0].scatter(X_train_scaled[:, 0], X_train_scaled[:, 1], c=method.labels_, cmap='viridis')
+axes[0].set_title('KMeans Clustering (Original Data)')
+
+method.fit(pca_data_train)
+axes[1].scatter(pca_data_train[:, 0], pca_data_train[:, 1], c=method.labels_, cmap='viridis')
+axes[1].set_title('KMeans Clustering (PCA Reduced Data)')
+
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(10, 6))
+plt.scatter(umap_data_train_best[:, 0], umap_data_train_best[:, 1], c=y_train, cmap='viridis', label='Train Data')
+plt.scatter(umap_data_test_best[:, 0], umap_data_test_best[:, 1], c=y_test, cmap='viridis', marker='x', label='Test Data')
+plt.title('UMAP Visualization')
+plt.xlabel('UMAP Dimension 1')
+plt.ylabel('UMAP Dimension 2')
+plt.legend()
+plt.colorbar(label='Target Class')
+plt.show()
+
+adaboost = AdaBoostClassifier(random_state=10)
+rf = RandomForestClassifier(random_state=10)
+
+adaboost_params = {'n_estimators': [50, 100, 150], 'learning_rate': [0.5, 1.0]}
+rf_params = {'n_estimators': [100, 200, 300], 'max_depth': [10, 20]}
+data_transformations = {'Original': (X_train_scaled, X_test_scaled),
+                        'PCA Reduced': (pca_data_train, pca_data_test),
+                        'UMAP Reduced': (best_umap_data, best_umap.transform(X_test_scaled))}
+
+best_models = {}
+accuracies = {}
+
+for method_name, (X_train_method, X_test_method) in data_transformations.items():
+    adaboost_grid = GridSearchCV(adaboost, adaboost_params, cv=3, scoring='accuracy')
+    adaboost_grid.fit(X_train_method, y_train)
+    best_adaboost = adaboost_grid.best_estimator_
+    best_models[method_name + ' AdaBoost'] = best_adaboost
+
+    rf_grid = GridSearchCV(rf, rf_params, cv=3, scoring='accuracy')
+    rf_grid.fit(X_train_method, y_train)
+    best_rf = rf_grid.best_estimator_
+    best_models[method_name + ' Random Forest'] = best_rf
+
+    adaboost_pred = best_adaboost.predict(X_test_method)
+    rf_pred = best_rf.predict(X_test_method)
+
+    adaboost_accuracy = accuracy_score(y_test, adaboost_pred)
+    rf_accuracy = accuracy_score(y_test, rf_pred)
+
+    accuracies[method_name + ' AdaBoost'] = adaboost_accuracy
+    accuracies[method_name + ' Random Forest'] = rf_accuracy
+
+for model_name, model in best_models.items():
+    print("Best parameters for", model_name, ":", model.get_params())
+
+for model_name, accuracy in accuracies.items():
+    print("Accuracy for", model_name, ":", accuracy)
